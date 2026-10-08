@@ -20,6 +20,7 @@ jobs:
             -I test/sim/stubs -I firmware/loco_hazard_helmet \
             test/sim/sim.cpp -o /tmp/sim
           /tmp/sim
+          /tmp/sim nomax
 
   compile-firmware:
     name: Compile for ESP32
@@ -41,3 +42,4 @@ jobs:
             - name: Adafruit Unified Sensor
             - name: TinyGPSPlus
             - name: LiquidCrystal I2C
+            - name: SparkFun MAX3010x Pulse and Proximity Sensor Library

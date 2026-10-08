@@ -16,6 +16,8 @@ static int failures = 0;
   } while (0)
 
 static const Thresholds TH = {30.0f, 70.0f, 1.0f};
+static const GasLimits GAS = {500, 3000, 100};
+static const VitalsLimits VIT = {90, 45, 140, 2, 3};
 
 static void testTracker() {
   HazardTracker t(TH);
@@ -43,6 +45,71 @@ static void testTracker() {
   CHECK(!t.active());
 }
 
+static void testGas() {
+  GasTracker g(GAS);
+  const int base = 800;  // trip level = min(800+500, 3000) = 1300
+  CHECK(gasTripLevel(base, GAS) == 1300);
+
+  CHECK(!g.update(1300, base));  // relative limit is strict: equal does not trip
+  CHECK(g.update(1301, base));
+  CHECK(g.active());
+  CHECK(!g.update(1250, base));  // inside the hysteresis band: stays latched
+  CHECK(g.active());
+  CHECK(g.update(1199, base));   // below trip - hysteresis: clears
+  CHECK(!g.active());
+
+  // Baseline taken in smoky air: the absolute ceiling still trips.
+  GasTracker g2(GAS);
+  const int badBase = 2900;
+  CHECK(gasTripLevel(badBase, GAS) == 3000);
+  CHECK(!g2.update(2999, badBase));
+  CHECK(g2.update(3000, badBase));
+  CHECK(!g2.update(2950, badBase));  // within hysteresis of 3000
+  CHECK(g2.active());
+  CHECK(g2.update(2899, badBase));
+  CHECK(!g2.active());
+
+  g2.update(3500, badBase);
+  g2.reset();
+  CHECK(!g2.active());
+}
+
+static void testVitals() {
+  VitalsTracker v(VIT);  // confirm = 3
+  CHECK(!v.update(97, 72));
+  CHECK(!v.active());
+
+  // One or two bad readings (motion artefact) must not alarm...
+  CHECK(!v.update(85, 72));
+  CHECK(!v.update(85, 72));
+  CHECK(!v.update(97, 72));          // ...and a good one resets the count
+  CHECK(!v.update(85, 72));
+  CHECK(!v.update(85, 72));
+  CHECK(v.update(85, 72));           // third in a row trips it
+  CHECK(v.active());
+
+  // Clearing needs 3 readings clear of the limit by the hysteresis (90 + 2).
+  CHECK(!v.update(91, 72));          // in the band: neither confirms nor clears
+  CHECK(!v.update(95, 72));
+  CHECK(!v.update(95, 72));
+  CHECK(v.active());
+  CHECK(v.update(95, 72));
+  CHECK(!v.active());
+
+  // Heart rate limits, high and low.
+  VitalsTracker h(VIT);
+  h.update(97, 141); h.update(97, 141);
+  CHECK(h.update(97, 141) && h.active());
+  VitalsTracker l(VIT);
+  l.update(97, 44); l.update(97, 44);
+  CHECK(l.update(97, 44) && l.active());
+
+  // Sensor removed: reset() clears the alarm, and says so only if it was active.
+  CHECK(l.reset());
+  CHECK(!l.active());
+  CHECK(!l.reset());
+}
+
 static void testUrlEncode() {
   char out[64];
   size_t n = urlEncode("a b\nc?=&é", out, sizeof out);
@@ -67,31 +134,65 @@ static void testUrlEncode() {
   CHECK(urlEncode("abc", out, 0) == 0);
 }
 
+static AlertContext ctx(uint8_t causes, bool fix) {
+  AlertContext c;
+  std::memset(&c, 0, sizeof c);
+  c.causes = causes;
+  c.tempC = 35.0f;
+  c.humPct = 50.0f;
+  c.th = TH;
+  c.gasRaw = 2100;
+  c.gasBaseline = 800;
+  c.gas = GAS;
+  c.spo2 = 88;
+  c.hr = 72;
+  c.vitals = VIT;
+  c.hasFix = fix;
+  c.lat = 12.971600;
+  c.lon = 77.594600;
+  return c;
+}
+
 static void testFormatAlert() {
-  char buf[256];
-  formatAlert(buf, sizeof buf, 35.0f, 50.0f, true, 12.971600, 77.594600, TH);
-  CHECK(std::strstr(buf, "high temperature") != nullptr);
-  CHECK(std::strstr(buf, "high humidity") == nullptr);
+  char buf[512];
+
+  formatAlert(buf, sizeof buf, ctx(CAUSE_ENV, true));
+  CHECK(std::strstr(buf, "HAZARD DETECTED") == buf);
+  CHECK(std::strstr(buf, "Heat/humidity: temperature 35.0 C (limit 30.0), humidity 50 % (limit 70)") != nullptr);
+  CHECK(std::strstr(buf, "Gas/smoke") == nullptr);
+  CHECK(std::strstr(buf, "Wearer vitals") == nullptr);
   CHECK(std::strstr(buf, "https://maps.google.com/?q=12.971600,77.594600") != nullptr);
 
-  formatAlert(buf, sizeof buf, 35.0f, 80.0f, false, 0, 0, TH);
-  CHECK(std::strstr(buf, "high temperature and humidity") != nullptr);
+  formatAlert(buf, sizeof buf, ctx(CAUSE_GAS, false));
+  CHECK(std::strstr(buf, "sensor reading 2100 (clean-air baseline 800, alarm level 1300)") != nullptr);
+  CHECK(std::strstr(buf, "Heat/humidity") == nullptr);
   CHECK(std::strstr(buf, "no GPS fix") != nullptr);
 
-  formatAlert(buf, sizeof buf, 29.5f, 50.0f, false, 0, 0, TH);
-  CHECK(std::strstr(buf, "hazard still active") != nullptr);
+  formatAlert(buf, sizeof buf, ctx(CAUSE_VITALS, false));
+  CHECK(std::strstr(buf, "SpO2 88 % (min 90), heart rate 72 bpm (range 45-140)") != nullptr);
+  CHECK(std::strstr(buf, "Indicative only") != nullptr);
 
-  // Tiny buffers must stay terminated and in bounds.
-  for (size_t cap = 1; cap < 40; ++cap) {
-    char tiny[64];
-    std::memset(tiny, 'X', sizeof tiny);
-    formatAlert(tiny, cap, 35.0f, 80.0f, true, 1.0, 2.0, TH);
-    CHECK(std::strlen(tiny) < cap);
+  formatAlert(buf, sizeof buf, ctx(CAUSE_ENV | CAUSE_GAS | CAUSE_VITALS, true));
+  CHECK(std::strstr(buf, "Heat/humidity") != nullptr);
+  CHECK(std::strstr(buf, "Gas/smoke") != nullptr);
+  CHECK(std::strstr(buf, "Wearer vitals") != nullptr);
+
+  // Tiny buffers must stay terminated and in bounds, for every combination.
+  for (uint8_t causes = 1; causes < 8; ++causes) {
+    for (size_t cap = 1; cap < 330; ++cap) {
+      char tiny[400];
+      std::memset(tiny, 'X', sizeof tiny);
+      formatAlert(tiny, cap, ctx(causes, true));
+      CHECK(std::strlen(tiny) < cap);
+      CHECK(tiny[cap] == 'X' || cap >= sizeof tiny);  // nothing written past cap
+    }
   }
 }
 
 int main() {
   testTracker();
+  testGas();
+  testVitals();
   testUrlEncode();
   testFormatAlert();
   if (failures) {
