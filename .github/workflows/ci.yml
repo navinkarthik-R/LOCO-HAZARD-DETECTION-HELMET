@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  host-tests:
+    name: Unit tests and firmware simulation
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Hazard logic unit tests
+        run: |
+          g++ -std=c++17 -Wall -Wextra -Werror test/test_logic.cpp -o /tmp/test_logic
+          /tmp/test_logic
+      - name: Firmware simulation (fake clock, sensor, network)
+        run: |
+          g++ -std=gnu++17 -Wall -Wextra -Werror -x c++ \
+            -I test/sim/stubs -I firmware/loco_hazard_helmet \
+            test/sim/sim.cpp -o /tmp/sim
+          /tmp/sim
+
+  compile-firmware:
+    name: Compile for ESP32
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Create a dummy secrets.h
+        run: cp firmware/loco_hazard_helmet/secrets.h.example firmware/loco_hazard_helmet/secrets.h
+      - uses: arduino/compile-sketches@v1
+        with:
+          fqbn: esp32:esp32:esp32
+          platforms: |
+            - name: esp32:esp32
+              source-url: https://espressif.github.io/arduino-esp32/package_esp32_index.json
+          sketch-paths: |
+            - firmware/loco_hazard_helmet
+          libraries: |
+            - name: DHT sensor library
+            - name: Adafruit Unified Sensor
+            - name: TinyGPSPlus
+            - name: LiquidCrystal I2C
